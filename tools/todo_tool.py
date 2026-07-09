@@ -77,8 +77,11 @@ class TodoStore:
                     continue  # Can't merge without an id
 
                 if item_id in existing:
-                    # Update only the fields the LLM actually provided
-                    if "content" in t and t["content"]:
+                    # Update only the fields the LLM actually provided.
+                    # An empty/blank content string is treated as "not
+                    # provided" so we keep the prior content rather than
+                    # silently wiping it.
+                    if "content" in t and str(t["content"]).strip():
                         existing[item_id]["content"] = self._cap_content(str(t["content"]).strip())
                     if "status" in t and t["status"]:
                         status = str(t["status"]).strip().lower()
