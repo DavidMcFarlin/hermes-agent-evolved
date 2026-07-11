@@ -10,6 +10,18 @@ from tools.cronjob_tools import (
 )
 
 
+def _save_distinct_reports(job_id: str, *contents: str) -> None:
+    """Write report files directly with distinct timestamps — going through
+    save_job_output()'s real (second-granularity) auto-naming would collide
+    when called twice in the same test."""
+    from cron.jobs import _job_output_dir
+
+    out_dir = _job_output_dir(job_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for i, content in enumerate(contents):
+        (out_dir / f"2026-01-01_00-00-{i:02d}.md").write_text(content, encoding="utf-8")
+
+
 # =========================================================================
 # Cron prompt scanning
 # =========================================================================
@@ -386,6 +398,47 @@ class TestUnifiedCronjobTool:
         assert updated["success"] is True
         stored = get_job(created["job_id"])
         assert stored["deliver"] == "telegram"
+
+    def test_report_reads_most_recent_run_by_default(self):
+        created = json.loads(cronjob(action="create", prompt="x", schedule="every 1h"))
+        job_id = created["job_id"]
+        _save_distinct_reports(job_id, "# First run\nAll good.", "# Second run\nSomething broke.")
+
+        result = json.loads(cronjob(action="report", job_id=job_id))
+        assert result["success"] is True
+        assert result["run_index"] == 0
+        assert result["available_runs"] == 2
+        assert "Something broke" in result["report"]
+
+    def test_report_run_index_reaches_older_runs(self):
+        created = json.loads(cronjob(action="create", prompt="x", schedule="every 1h"))
+        job_id = created["job_id"]
+        _save_distinct_reports(job_id, "# First run\nAll good.", "# Second run\nSomething broke.")
+
+        result = json.loads(cronjob(action="report", job_id=job_id, run_index=1))
+        assert result["success"] is True
+        assert "All good" in result["report"]
+
+    def test_report_no_runs_yet_is_a_clean_error(self):
+        created = json.loads(cronjob(action="create", prompt="x", schedule="every 1h"))
+        result = json.loads(cronjob(action="report", job_id=created["job_id"]))
+        assert result["success"] is False
+        assert "may never have run" in result["error"].lower()
+
+    def test_report_run_index_out_of_range_is_a_clean_error(self):
+        from cron.jobs import save_job_output
+
+        created = json.loads(cronjob(action="create", prompt="x", schedule="every 1h"))
+        job_id = created["job_id"]
+        save_job_output(job_id, "# Only run\nfine.")
+
+        result = json.loads(cronjob(action="report", job_id=job_id, run_index=5))
+        assert result["success"] is False
+        assert "out of range" in result["error"].lower()
+
+    def test_report_unknown_job_id_errors_like_other_actions(self):
+        result = json.loads(cronjob(action="report", job_id="does-not-exist"))
+        assert result["success"] is False
 
 
 # =========================================================================

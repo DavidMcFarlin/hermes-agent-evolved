@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import (
     AmbiguousJobReference,
+    _job_output_dir,
     claim_job_for_fire,
     create_job,
     get_job,
@@ -728,6 +729,7 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    run_index: int = 0,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -911,6 +913,48 @@ def cronjob(
                 result["execution_error"] = exec_result["error"]
             return json.dumps({"success": True, "job": result}, indent=2)
 
+        if normalized == "report":
+            # list/run only ever surface last_status/last_run_at — the actual
+            # report (what the job's agent turn produced) lives on disk and
+            # was previously invisible to the agent itself, so it could never
+            # notice or act on a problem unless the user pasted the details in.
+            try:
+                out_dir = _job_output_dir(job_id)
+            except ValueError as exc:
+                return tool_error(str(exc), success=False)
+            if not out_dir.is_dir():
+                return tool_error(
+                    f"No reports found for job '{job['name']}' ({job_id}) — it may never have run.",
+                    success=False,
+                )
+            files = sorted(out_dir.glob("*.md"), reverse=True)  # filenames are timestamps, so lexical == chronological
+            if not files:
+                return tool_error(
+                    f"No reports found for job '{job['name']}' ({job_id}) — it may never have run.",
+                    success=False,
+                )
+            idx = max(0, int(run_index or 0))
+            if idx >= len(files):
+                return tool_error(
+                    f"run_index {idx} out of range — only {len(files)} report(s) retained for this job.",
+                    success=False,
+                )
+            report_file = files[idx]
+            content = report_file.read_text(encoding="utf-8", errors="replace")
+            return json.dumps(
+                {
+                    "success": True,
+                    "job_id": job_id,
+                    "name": job["name"],
+                    "run_index": idx,
+                    "run_at": report_file.stem,
+                    "available_runs": len(files),
+                    "report": content[:20000],
+                    "truncated": len(content) > 20000,
+                },
+                indent=2,
+            )
+
         if normalized == "update":
             updates: Dict[str, Any] = {}
             if prompt is not None:
@@ -1029,8 +1073,9 @@ CRONJOB_SCHEMA = {
     "description": """Manage scheduled cron jobs with a single compressed tool.
 
 Use action='create' to schedule a new job from a prompt or one or more skills.
-Use action='list' to inspect jobs.
+Use action='list' to inspect jobs — this only returns last_status/last_run_at, NOT what the job actually produced.
 Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing job.
+Use action='report' to read a run's FULL output (job_id required; optional run_index, 0=most recent, 1=one before that, etc.). This is how you actually see what happened during a run and notice/act on a problem yourself, instead of only knowing last_status was 'ok' or 'error' with no detail.
 
 To stop a job the user no longer wants: first action='list' to find the job_id, then action='remove' with that job_id. Never guess job IDs — always list first.
 
@@ -1048,11 +1093,15 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
         "properties": {
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+                "description": "One of: create, list, update, pause, resume, remove, run, report. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
             },
             "job_id": {
                 "type": "string",
-                "description": "Required for update/pause/resume/remove/run"
+                "description": "Required for update/pause/resume/remove/run/report"
+            },
+            "run_index": {
+                "type": "integer",
+                "description": "For action=report only. 0 (default) = most recent run's report, 1 = the run before that, etc."
             },
             "prompt": {
                 "type": "string",
@@ -1184,6 +1233,7 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        run_index=args.get("run_index", 0),
         task_id=kw.get("task_id"),
     ),
     check_fn=check_cronjob_requirements,
