@@ -1845,6 +1845,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
+            ("POST", "/v1/runs/{run_id}/clarify", self._handle_run_clarify),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
         ]
         if _CRON_AVAILABLE:
@@ -6247,6 +6248,54 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 self._active_run_agents[run_id] = agent
 
+                # ── Local patch (Eleutheria, 2026-08-01): reasoning deltas +
+                # interactive clarify on /v1/runs. Upstream binds neither
+                # callback here; AIAgent supports both (run_agent.py:466-467).
+                # Additive only, mirrors the approval round-trip pattern.
+                def _reasoning_cb(text: Optional[str]) -> None:
+                    if not text or run_id not in self._run_streams:
+                        return
+                    try:
+                        loop.call_soon_threadsafe(_put_event_if_active, {
+                            "event": "reasoning.delta",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "text": text,
+                        })
+                    except Exception:
+                        pass
+
+                agent.reasoning_callback = _reasoning_cb
+
+                def _clarify_cb(question, choices=None, multi_select=False):
+                    from tools import clarify_gateway as _cg
+
+                    clarify_id = f"cl_{uuid.uuid4().hex}"
+                    _cg.register(clarify_id, run_id, question, choices or [],
+                                 bool(multi_select))
+                    self._set_run_status(run_id, "waiting_for_clarify",
+                                         last_event="clarify.request")
+                    try:
+                        loop.call_soon_threadsafe(_put_event_if_active, {
+                            "event": "clarify.request",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "clarify_id": clarify_id,
+                            "question": str(question or ""),
+                            "choices": list(choices or []),
+                            "multi_select": bool(multi_select),
+                        })
+                    except Exception:
+                        pass
+                    resp = _cg.wait_for_response(clarify_id, _cg.get_clarify_timeout())
+                    self._set_run_status(run_id, "running",
+                                         last_event="clarify.responded")
+                    if resp is None:
+                        return "[user did not respond to the clarify prompt]"
+                    return resp
+
+                agent.clarify_callback = _clarify_cb
+
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     event = dict(approval_data or {})
                     # Redact credentials from the command before it enters the
@@ -6632,6 +6681,68 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
+    async def _handle_run_clarify(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/clarify — answer a pending clarify prompt.
+
+        Local patch (Eleutheria, 2026-08-01); mirrors _handle_run_approval.
+        Body: {"clarify_id": "...", "response": "..."}."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        if self._run_statuses.get(run_id) is None:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        clarify_id = str(body.get("clarify_id", "")).strip()
+        response_text = str(body.get("response", "")).strip()
+        if not clarify_id or not response_text:
+            return web.json_response(
+                _openai_error("clarify_id and response are required",
+                              code="invalid_clarify_response"),
+                status=400,
+            )
+        try:
+            from tools.clarify_gateway import resolve_gateway_clarify
+
+            resolved = resolve_gateway_clarify(clarify_id, response_text)
+        except Exception as exc:
+            logger.exception("[api_server] clarify resolution failed for run %s", run_id)
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        if not resolved:
+            return web.json_response(
+                _openai_error(f"Run has no pending clarify: {run_id}",
+                              code="clarify_not_pending"),
+                status=409,
+            )
+
+        self._set_run_status(run_id, "running", last_event="clarify.responded")
+        q = self._run_streams.get(run_id)
+        if q is not None:
+            try:
+                q.put_nowait({
+                    "event": "clarify.responded",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "clarify_id": clarify_id,
+                })
+            except Exception:
+                pass
+
+        return web.json_response({
+            "object": "hermes.run.clarify_response",
+            "run_id": run_id,
+            "clarify_id": clarify_id,
+        })
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -6647,6 +6758,15 @@ class APIServerAdapter(BasePlatformAdapter):
 
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
         self._stopping_run_ids.add(run_id)
+
+        # Local patch (Eleutheria): a stop must also release an agent thread
+        # parked on a clarify prompt, or it blocks until the clarify timeout.
+        try:
+            from tools.clarify_gateway import clear_session as _clarify_clear
+
+            _clarify_clear(run_id)
+        except Exception:
+            pass
 
         if agent is not None:
             try:
