@@ -734,3 +734,23 @@ async def grant_computer_use_permissions(profile: Optional[str] = None):
             status_code=500, detail=f"Failed to request permissions: {exc}"
         )
     return {"ok": True, "pid": proc.pid, "name": "computer-use-grant"}
+
+
+@router.get("/api/tools/telemetry")
+async def get_tool_telemetry(days: float = 7):
+    """Per-tool invocation aggregates (calls, failures, failure_rate, avg
+    latency) from the real dispatch ledger, worst failure rate first."""
+    from tools.tool_telemetry import stats
+
+    return {"days": days, "tools": stats(days=days)}
+
+
+@router.get("/api/tools/telemetry/failures")
+async def get_tool_telemetry_failures(
+    tool: Optional[str] = None, days: float = 7, limit: int = 50
+):
+    """Recent failing invocations (newest first) with error snippets and
+    session ids, for drilling into WHY a tool is failing."""
+    from tools.tool_telemetry import failures
+
+    return {"days": days, "tool": tool, "failures": failures(tool=tool, days=days, limit=limit)}

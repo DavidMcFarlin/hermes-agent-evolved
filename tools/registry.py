@@ -765,7 +765,23 @@ class ToolRegistry:
           envelope before leaving the registry.
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
+        * Every call is recorded in the tool-telemetry ledger (outcome +
+          latency) — the data evolution targeting and the dashboard's
+          failure-rate view run on. Recording is best-effort and never
+          affects the result.
         """
+        t0 = time.monotonic()
+        result = self._dispatch_inner(name, args, **kwargs)
+        try:
+            from tools.tool_telemetry import classify_result, record
+            ok, error_type, error = classify_result(result)
+            record(name, ok, error_type=error_type, error=error,
+                   elapsed_ms=int((time.monotonic() - t0) * 1000))
+        except Exception:  # noqa: BLE001 — telemetry must never break a tool call
+            pass
+        return result
+
+    def _dispatch_inner(self, name: str, args: dict, **kwargs) -> str | dict:
         entry = self.get_entry(name)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
