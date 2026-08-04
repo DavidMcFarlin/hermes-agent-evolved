@@ -133,6 +133,75 @@ def _truncate_stdout_text(stdout_text: str) -> Tuple[str, Dict[str, Any]]:
         total_bytes=len(stdout_bytes),
     )
 
+
+def _assemble_stderr_text(head: bytes, tail: bytes, total_bytes: int) -> str:
+    """Join head/tail stderr chunks for display, trimmed to a line boundary.
+
+    Python tracebacks put the actual exception (the most actionable part)
+    on the last line, so a truncated capture must never end mid-line — that
+    silently drops or garbles the "ExceptionType: message" line the agent
+    needs to self-correct. When truncated, trim each edge back to the
+    nearest newline and mark the cut explicitly so a truncated fragment is
+    never mistaken for the complete traceback.
+    """
+    captured = head + tail
+    if total_bytes <= len(captured):
+        return captured.decode("utf-8", errors="replace")
+
+    head_text = head.decode("utf-8", errors="replace")
+    tail_text = tail.decode("utf-8", errors="replace")
+    head_cut = head_text.rfind("\n")
+    if head_cut != -1:
+        head_text = head_text[:head_cut]
+    tail_cut = tail_text.find("\n")
+    if tail_cut != -1:
+        tail_text = tail_text[tail_cut + 1:]
+
+    omitted = total_bytes - len(captured)
+    return (
+        head_text
+        + f"\n\n... [STDERR TRUNCATED - {omitted:,} bytes omitted out of "
+        f"{total_bytes:,} total] ...\n\n"
+        + tail_text
+    )
+
+
+_EXCEPTION_LINE_RE = re.compile(r'^([A-Za-z_][\w.]*(?:Error|Exception|Warning)):\s?(.*)$')
+
+
+def _traceback_exception_hint(stderr_text: str) -> Optional[str]:
+    """Best-effort exception type + failing-line excerpt from a traceback.
+
+    Complements ``_sandbox_failure_hint`` (which targets known sandbox-misuse
+    patterns) by summarizing ordinary script bugs (IndexError, TypeError from
+    a bad f-string over a DB row, etc.) so the agent gets a one-line pointer
+    instead of having to re-read the whole traceback to figure out what to
+    fix on the next attempt. Bounded scan, never raises.
+    """
+    if not stderr_text:
+        return None
+    try:
+        lines = stderr_text.rstrip().splitlines()
+        for i in range(len(lines) - 1, -1, -1):
+            m = _EXCEPTION_LINE_RE.match(lines[i].strip())
+            if not m:
+                continue
+            exc_type, exc_msg = m.group(1), m.group(2)
+            code_line = None
+            for j in range(i - 1, -1, -1):
+                candidate = lines[j].strip()
+                if candidate:
+                    code_line = candidate
+                    break
+            summary = f"{exc_type}: {exc_msg}".strip()
+            if code_line and code_line != summary:
+                summary += f" (failing line: {code_line})"
+            return summary
+    except Exception:
+        return None
+    return None
+
+
 # Environment variable scrubbing rules (shared between the local + remote
 # backends).  Secret-substring block is applied first; anything left must
 # match a safe prefix, the operational HERMES_ allowlist, or (on Windows) an
@@ -1255,6 +1324,9 @@ def _execute_remote(
     elif exit_code != 0:
         result["status"] = "error"
         result["error"] = f"Script exited with code {exit_code}"
+        hint = _traceback_exception_hint(stdout_text)
+        if hint:
+            result["hint"] = hint
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -1506,34 +1578,23 @@ def execute_code(
 
         # --- Poll loop: watch for exit, timeout, and interrupt ---
         deadline = time.monotonic() + timeout
-        stderr_chunks: list = []
 
         # Background readers to avoid pipe buffer deadlocks.
-        # For stdout we use a head+tail strategy: keep the first HEAD_BYTES
-        # and a rolling window of the last TAIL_BYTES so the final print()
-        # output is never lost.  Stderr keeps head-only (errors appear early).
+        # Both streams use a head+tail strategy: keep the first HEAD_BYTES
+        # and a rolling window of the last TAIL_BYTES.  For stdout that
+        # preserves the final print() output; for stderr it preserves the
+        # actual "ExceptionType: message" line, which Python always writes
+        # last — a head-only cap can silently drop it on a large traceback.
         _STDOUT_HEAD_BYTES = int(MAX_STDOUT_BYTES * 0.4)   # 40% head
         _STDOUT_TAIL_BYTES = MAX_STDOUT_BYTES - _STDOUT_HEAD_BYTES  # 60% tail
-
-        def _drain(pipe, chunks, max_bytes):
-            """Simple head-only drain (used for stderr)."""
-            total = 0
-            try:
-                while True:
-                    data = pipe.read(4096)
-                    if not data:
-                        break
-                    if total < max_bytes:
-                        keep = max_bytes - total
-                        chunks.append(data[:keep])
-                    total += len(data)
-            except (ValueError, OSError) as e:
-                logger.debug("Error reading process output: %s", e, exc_info=True)
+        _STDERR_HEAD_BYTES = int(MAX_STDERR_BYTES * 0.2)   # 20% head
+        _STDERR_TAIL_BYTES = MAX_STDERR_BYTES - _STDERR_HEAD_BYTES  # 80% tail
 
         stdout_total_bytes = [0]  # mutable ref for total bytes seen
+        stderr_total_bytes = [0]
 
         def _drain_head_tail(pipe, head_chunks, tail_chunks, head_bytes, tail_bytes, total_ref):
-            """Drain stdout keeping both head and tail data."""
+            """Drain a pipe keeping both head and tail data."""
             head_collected = 0
             from collections import deque
             tail_buf = deque()
@@ -1566,6 +1627,8 @@ def execute_code(
 
         stdout_head_chunks: list = []
         stdout_tail_chunks: list = []
+        stderr_head_chunks: list = []
+        stderr_tail_chunks: list = []
 
         stdout_reader = threading.Thread(
             target=_drain_head_tail,
@@ -1574,7 +1637,10 @@ def execute_code(
             daemon=True
         )
         stderr_reader = threading.Thread(
-            target=_drain, args=(proc.stderr, stderr_chunks, MAX_STDERR_BYTES), daemon=True
+            target=_drain_head_tail,
+            args=(proc.stderr, stderr_head_chunks, stderr_tail_chunks,
+                  _STDERR_HEAD_BYTES, _STDERR_TAIL_BYTES, stderr_total_bytes),
+            daemon=True
         )
         stdout_reader.start()
         stderr_reader.start()
@@ -1616,7 +1682,11 @@ def execute_code(
         stdout_reader.join(timeout=3)
         stderr_reader.join(timeout=3)
 
-        stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+        stderr_text = _assemble_stderr_text(
+            b"".join(stderr_head_chunks),
+            b"".join(stderr_tail_chunks),
+            stderr_total_bytes[0],
+        )
 
         stdout_text, stdout_metadata = _assemble_stdout_result(
             b"".join(stdout_head_chunks),
@@ -1684,8 +1754,13 @@ def execute_code(
                 result["output"] = stdout_text + "\n--- stderr ---\n" + stderr_text
             # Known-failure-class recovery hint (import misuse, missing
             # module, dict-vs-string result handling) so the model fixes
-            # the script on the next attempt instead of re-diagnosing.
+            # the script on the next attempt instead of re-diagnosing. Fall
+            # back to a generic exception-type + failing-line summary for
+            # ordinary script bugs (IndexError, TypeError, ...) that don't
+            # match a known sandbox-misuse pattern.
             hint = _sandbox_failure_hint(stderr_text, enabled_tools=sandbox_tools)
+            if not hint:
+                hint = _traceback_exception_hint(stderr_text)
             if hint:
                 result["hint"] = hint
 
