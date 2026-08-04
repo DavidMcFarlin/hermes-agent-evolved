@@ -258,7 +258,14 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError: os.open() rejects a path containing an embedded NUL —
+        # which is exactly what tokenizing a BINARY's decoded contents
+        # produces (the caller's resolve() already tolerates this, but the
+        # open did not). Uncaught, it escaped the guard and failed the whole
+        # terminal command: live 2026-08-04, `./bedrock_server` in a Minecraft
+        # server update died with "Failed to execute command: embedded null
+        # byte" (#76762 follow-up).
         return None, False
     try:
         metadata = os.fstat(descriptor)

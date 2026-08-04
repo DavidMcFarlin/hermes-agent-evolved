@@ -857,3 +857,29 @@ class TestCronCreateLifecycleBlockExtra:
         assert rc == 1
         out = capsys.readouterr().out
         assert "Blocked" in out
+
+
+class TestBinaryReferencedPaths:
+    """A command referencing a BINARY must not crash the lifecycle guard.
+
+    Regression 2026-08-04: tokenizing a binary's decoded contents produced a
+    path with an embedded NUL; os.open() raises ValueError (not OSError) for
+    those, and only OSError was caught. The escape failed the whole terminal
+    command — a live Minecraft server update died with 'Failed to execute
+    command: embedded null byte' while running ./bedrock_server.
+    """
+
+    def test_read_referenced_script_survives_nul_in_path(self):
+        from pathlib import Path
+        from cron.lifecycle_guard import _read_referenced_script
+        text, unsafe = _read_referenced_script(Path("/tmp/bedrock\x00server"))
+        assert text is None and unsafe is False
+
+    def test_guard_allows_command_running_a_binary(self, tmp_path):
+        from cron.lifecycle_guard import _contains_unsafe_gateway_action
+        binary = tmp_path / "bedrock_server"
+        binary.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 200 + b"/bin/sh\x00")
+        binary.chmod(0o755)
+        assert _contains_unsafe_gateway_action(
+            f"cd {tmp_path} && LD_LIBRARY_PATH=. ./bedrock_server",
+            cwd=str(tmp_path), depth=0, visited=set()) is False
