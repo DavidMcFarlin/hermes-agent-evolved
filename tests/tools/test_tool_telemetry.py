@@ -111,3 +111,33 @@ class TestTargetAttribution:
         conn.commit(); conn.close()
         tool_telemetry.record("x", True, target="t")  # must not raise on old schema
         assert tool_telemetry.stats(days=1)[0]["tool"] == "x"
+
+
+class TestSlowCalls:
+    """A minutes-long tool call blocks the turn and reads as a dropped reply
+    (2026-08-04: a 1272s stall was mistaken for chat instability for weeks).
+    It must be named in the log and counted in the stats."""
+
+    def test_stats_count_slow_calls_and_report_max(self, telemetry_db):
+        tool_telemetry.record("slowpoke", True, elapsed_ms=tool_telemetry.SLOW_CALL_MS + 1)
+        tool_telemetry.record("slowpoke", True, elapsed_ms=1_000)
+        row = {r["tool"]: r for r in tool_telemetry.stats(days=1)}["slowpoke"]
+        assert row["slow"] == 1
+        assert row["max_ms"] == tool_telemetry.SLOW_CALL_MS + 1
+
+    def test_fast_calls_are_not_flagged(self, telemetry_db):
+        tool_telemetry.record("quick", True, elapsed_ms=500)
+        assert {r["tool"]: r for r in tool_telemetry.stats(days=1)}["quick"]["slow"] == 0
+
+    def test_dispatch_warns_on_a_slow_call(self, telemetry_db, monkeypatch, caplog):
+        import logging, time as _time
+        reg = ToolRegistry()
+        real = _time.monotonic
+        ticks = iter([0.0, tool_telemetry.SLOW_CALL_MS / 1000 + 5])
+        monkeypatch.setattr(
+            "tools.registry.time.monotonic", lambda: next(ticks, real()))
+        reg.register(name="slowtool", toolset="core", schema=_schema("slowtool"),
+                     handler=lambda args, **kw: "done")
+        with caplog.at_level(logging.WARNING, logger="tools.registry"):
+            reg.dispatch("slowtool", {})
+        assert any("SLOW TOOL CALL" in r.message for r in caplog.records)

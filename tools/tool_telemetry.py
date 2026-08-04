@@ -25,6 +25,11 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 RETENTION_DAYS = 90
+# A call at or past this holds the conversation turn long enough that the user
+# reads it as a dropped reply. Measured basis: the lifecycle-guard binary stall
+# ran 1272s; ordinary terminal calls sit around 6s and the slowest legitimate
+# one observed was 183s.
+SLOW_CALL_MS = 120_000
 _ERROR_SNIPPET_CHARS = 300
 
 
@@ -122,6 +127,8 @@ def stats(days: float = 7) -> list[dict]:
             rows = conn.execute(
                 "SELECT tool, COUNT(*) AS calls, SUM(1 - ok) AS failures,"
                 "       CAST(AVG(elapsed_ms) AS INTEGER) AS avg_ms,"
+                "       CAST(MAX(elapsed_ms) AS INTEGER) AS max_ms,"
+                f"      SUM(CASE WHEN elapsed_ms >= {SLOW_CALL_MS} THEN 1 ELSE 0 END) AS slow,"
                 "       MAX(ts) AS last_used"
                 " FROM tool_calls WHERE ts >= ?"
                 " GROUP BY tool",

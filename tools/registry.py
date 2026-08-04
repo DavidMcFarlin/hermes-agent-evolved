@@ -773,11 +773,24 @@ class ToolRegistry:
         t0 = time.monotonic()
         result = self._dispatch_inner(name, args, **kwargs)
         try:
-            from tools.tool_telemetry import classify_result, record, target_from_args
+            from tools.tool_telemetry import (
+                SLOW_CALL_MS, classify_result, record, target_from_args,
+            )
             ok, error_type, error = classify_result(result)
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            # A tool call that runs for minutes holds the whole turn: the user
+            # sees an empty reply and no error, and nothing anywhere says why.
+            # That is exactly how a 1272s lifecycle-guard stall read as "the
+            # chat keeps dropping" for weeks (2026-08-04). Name it while it is
+            # still fresh so the next one is found in minutes, not weeks.
+            if elapsed_ms >= SLOW_CALL_MS:
+                logger.warning(
+                    "SLOW TOOL CALL: %s took %.1fs (>= %.0fs) — a call this "
+                    "long blocks the turn and looks like a dropped reply",
+                    name, elapsed_ms / 1000, SLOW_CALL_MS / 1000,
+                )
             record(name, ok, error_type=error_type, error=error,
-                   elapsed_ms=int((time.monotonic() - t0) * 1000),
-                   target=target_from_args(args))
+                   elapsed_ms=elapsed_ms, target=target_from_args(args))
         except Exception:  # noqa: BLE001 — telemetry must never break a tool call
             pass
         return result
