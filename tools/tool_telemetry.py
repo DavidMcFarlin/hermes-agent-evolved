@@ -46,7 +46,27 @@ def _connect() -> sqlite3.Connection:
         " session TEXT)"
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_ts ON tool_calls(tool, ts)")
+    # v2: what the call operated on (skill name etc.) for per-target attribution.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(tool_calls)")}
+    if "target" not in cols:
+        conn.execute("ALTER TABLE tool_calls ADD COLUMN target TEXT")
     return conn
+
+
+# Argument keys whose value names the artifact a call operates on. Kept small
+# and generic — per-target failure attribution (e.g. which SKILL a
+# skill_view/skill_manage touched) needs this recorded at dispatch time.
+_TARGET_ARG_KEYS = ("name", "skill")
+
+
+def target_from_args(args) -> str | None:
+    if not isinstance(args, dict):
+        return None
+    for key in _TARGET_ARG_KEYS:
+        v = args.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()[:100]
+    return None
 
 
 def classify_result(result) -> tuple[bool, str | None, str | None]:
@@ -74,16 +94,17 @@ def _current_session() -> str | None:
 
 
 def record(tool: str, ok: bool, *, error_type: str | None = None,
-           error: str | None = None, elapsed_ms: int | None = None) -> None:
+           error: str | None = None, elapsed_ms: int | None = None,
+           target: str | None = None) -> None:
     """Append one invocation row. Best-effort — never raises."""
     try:
         with _connect() as conn:
             conn.execute(
-                "INSERT INTO tool_calls (ts, tool, ok, error_type, error, elapsed_ms, session)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO tool_calls (ts, tool, ok, error_type, error, elapsed_ms, session, target)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (time.time(), tool, 1 if ok else 0, error_type,
                  (error or "")[:_ERROR_SNIPPET_CHARS] or None,
-                 elapsed_ms, _current_session()),
+                 elapsed_ms, _current_session(), target),
             )
             # Opportunistic retention prune (~1% of writes).
             if random.random() < 0.01:
@@ -119,7 +140,7 @@ def failures(tool: str | None = None, days: float = 7, limit: int = 50) -> list[
     try:
         with _connect() as conn:
             conn.row_factory = sqlite3.Row
-            q = ("SELECT ts, tool, error_type, error, elapsed_ms, session"
+            q = ("SELECT ts, tool, target, error_type, error, elapsed_ms, session"
                  " FROM tool_calls WHERE ok = 0 AND ts >= ?")
             args: list = [time.time() - days * 86400]
             if tool:

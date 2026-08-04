@@ -773,10 +773,11 @@ class ToolRegistry:
         t0 = time.monotonic()
         result = self._dispatch_inner(name, args, **kwargs)
         try:
-            from tools.tool_telemetry import classify_result, record
+            from tools.tool_telemetry import classify_result, record, target_from_args
             ok, error_type, error = classify_result(result)
             record(name, ok, error_type=error_type, error=error,
-                   elapsed_ms=int((time.monotonic() - t0) * 1000))
+                   elapsed_ms=int((time.monotonic() - t0) * 1000),
+                   target=target_from_args(args))
         except Exception:  # noqa: BLE001 — telemetry must never break a tool call
             pass
         return result

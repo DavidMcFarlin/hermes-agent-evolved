@@ -81,3 +81,33 @@ class TestDispatchIntegration:
         reg.dispatch("ghost", {})
         assert tool_telemetry.stats(days=1)[0]["tool"] == "ghost"
         assert tool_telemetry.stats(days=1)[0]["failures"] == 1
+
+
+class TestTargetAttribution:
+    def test_target_extracted_and_recorded(self, telemetry_db):
+        assert tool_telemetry.target_from_args({"name": "gif-search"}) == "gif-search"
+        assert tool_telemetry.target_from_args({"skill": "plan"}) == "plan"
+        assert tool_telemetry.target_from_args({"other": 1}) is None
+        assert tool_telemetry.target_from_args("not-a-dict") is None
+
+        tool_telemetry.record("skill_manage", False, error_type="tool_error",
+                              error="refused", target="gif-search")
+        fails = tool_telemetry.failures(tool="skill_manage", days=1)
+        assert fails[0]["target"] == "gif-search"
+
+    def test_dispatch_records_target(self, telemetry_db):
+        reg = ToolRegistry()
+        reg.register(name="skillish", toolset="core", schema=_schema("skillish"),
+                     handler=lambda args, **kw: tool_error("nope"))
+        reg.dispatch("skillish", {"name": "obsidian"})
+        assert tool_telemetry.failures(days=1)[0]["target"] == "obsidian"
+
+    def test_v1_db_migrates_in_place(self, telemetry_db):
+        import sqlite3
+        conn = sqlite3.connect(telemetry_db)
+        conn.execute("CREATE TABLE tool_calls (ts REAL NOT NULL, tool TEXT NOT NULL,"
+                     " ok INTEGER NOT NULL, error_type TEXT, error TEXT,"
+                     " elapsed_ms INTEGER, session TEXT)")
+        conn.commit(); conn.close()
+        tool_telemetry.record("x", True, target="t")  # must not raise on old schema
+        assert tool_telemetry.stats(days=1)[0]["tool"] == "x"
