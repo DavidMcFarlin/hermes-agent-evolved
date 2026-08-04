@@ -875,6 +875,25 @@ class TestBinaryReferencedPaths:
         text, unsafe = _read_referenced_script(Path("/tmp/bedrock\x00server"))
         assert text is None and unsafe is False
 
+    def test_guard_is_fast_on_a_real_binary(self):
+        """The user-visible symptom was not the error, it was the HANG.
+
+        Live 2026-08-04: `./bedrock_server` made this guard chew for 1272s
+        before raising, so the chat turn sat silent for 21 minutes and Dave
+        resent his message mid-hang. Assert the guard stays in the
+        milliseconds on a large real binary."""
+        import shutil
+        import time
+        binary = shutil.which("bash")
+        if not binary:
+            import pytest as _pytest
+            _pytest.skip("no system binary available")
+        from cron.lifecycle_guard import _contains_unsafe_gateway_action
+        started = time.monotonic()
+        _contains_unsafe_gateway_action(
+            f"cd /tmp && {binary} --version", cwd="/tmp", depth=0, visited=set())
+        assert time.monotonic() - started < 5.0
+
     def test_guard_allows_command_running_a_binary(self, tmp_path):
         from cron.lifecycle_guard import _contains_unsafe_gateway_action
         binary = tmp_path / "bedrock_server"
