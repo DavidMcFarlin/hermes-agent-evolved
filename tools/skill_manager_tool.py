@@ -36,7 +36,8 @@ import json
 import logging
 import re
 import shutil
-import contextvars as _ctxvars
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -52,34 +53,39 @@ from agent.skill_utils import (
 
 logger = logging.getLogger(__name__)
 
-_background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
-    "background_review_read_paths", default=frozenset()
-)
+# Read-marks were a ContextVar, which broke under the parallel tool batch
+# planner: skill_view is read-only so it executes on a pool worker thread
+# whose fresh context sees origin="foreground" (mark skipped) — while the
+# skill_manage write runs at the sequential barrier in the fork's real
+# context, so the guard engaged with no mark and refused FOREVER. Live
+# 2026-08-03: the curator retried two patches every ~30s all evening (caught
+# by the new tool-telemetry ledger, 84.6% skill_manage failure rate).
+# A process-global, thread-safe, freshness-bounded store keeps the guard's
+# intent — content must have been loaded recently in this process before a
+# background write — while surviving thread/context hops.
+_READ_MARK_TTL_S = 900
+_READ_MARK_CAP = 512
+_read_marks_lock = threading.Lock()
+_read_marks: Dict[str, float] = {}  # resolved path -> time.monotonic() of read
 
 
 def mark_background_review_skill_read(path: Path) -> None:
-    """Record that the active background-review fork has read a skill file.
+    """Record that a skill file's current content was just returned to a model.
 
-    The autonomous review fork is allowed to evolve skills, but it must not
-    patch or rewrite content it has only inferred from the transcript.  The
-    skill_view tool calls this after returning file content to the model; write
-    paths below require the corresponding target path to be present when the
-    current origin is ``background_review``.
+    Marked unconditionally (not only under the background_review origin):
+    the executing thread's context can't be trusted to carry the origin, and
+    a stale-mark risk is bounded by the TTL in _background_review_has_read.
     """
-    try:
-        from tools.skill_provenance import is_background_review
-        if not is_background_review():
-            return
-    except Exception:
-        return
-
     try:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    current = set(_background_review_read_paths.get())
-    current.add(resolved)
-    _background_review_read_paths.set(frozenset(current))
+    with _read_marks_lock:
+        if len(_read_marks) >= _READ_MARK_CAP:
+            cutoff = time.monotonic() - _READ_MARK_TTL_S
+            for k in [k for k, ts in _read_marks.items() if ts < cutoff]:
+                del _read_marks[k]
+        _read_marks[resolved] = time.monotonic()
 
 
 def _background_review_has_read(path: Path) -> bool:
@@ -87,12 +93,15 @@ def _background_review_has_read(path: Path) -> bool:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    return resolved in _background_review_read_paths.get()
+    with _read_marks_lock:
+        ts = _read_marks.get(resolved)
+    return ts is not None and (time.monotonic() - ts) < _READ_MARK_TTL_S
 
 
 def _reset_background_review_read_marks() -> None:
-    """Test helper: clear read-before-write marks for the current context."""
-    _background_review_read_paths.set(frozenset())
+    """Test helper: clear read-before-write marks."""
+    with _read_marks_lock:
+        _read_marks.clear()
 
 # Import security scanner — external hub installs always get scanned;
 # agent-created skills only get scanned when skills.guard_agent_created is on.

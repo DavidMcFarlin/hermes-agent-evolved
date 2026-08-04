@@ -916,3 +916,49 @@ class TestGitAutoCommit:
         with _skill_dir(tmp_path):
             result = json.loads(skill_manage("create", "test-skill", content=VALID_SKILL_CONTENT))
         assert result["success"]  # no .git — write succeeds, no commit attempted
+
+
+class TestReadMarksSurviveThreadHop:
+    """Regression 2026-08-03: the batch planner runs read-only skill_view on a
+    pool worker thread with a fresh context, so ContextVar-based read marks
+    (and the origin flag that gated marking) were lost — the curator's writes
+    were refused forever, retrying every ~30s all evening."""
+
+    def test_read_on_worker_thread_authorizes_write_in_fork_context(self, tmp_path, monkeypatch):
+        import threading as _threading
+        from tools.skills_tool import skill_view
+        from tools.skill_manager_tool import _reset_background_review_read_marks
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+            _create_curator_skill("hopper", _skill_content("hopper"))
+
+            # Simulate the parallel segment: the read happens on a fresh
+            # thread whose context has neither the fork origin nor any marks.
+            view_result = {}
+            t = _threading.Thread(
+                target=lambda: view_result.update(json.loads(skill_view("hopper"))))
+            t.start(); t.join()
+            assert view_result["success"] is True
+
+            # The write happens back in the fork's own context and must see
+            # the mark the worker-thread read left behind.
+            patched = json.loads(skill_manage(
+                action="patch", name="hopper",
+                old_string="Step 1", new_string="Step ONE",
+            ))
+            assert patched["success"] is True, patched
+        _reset_background_review_read_marks()
+
+    def test_stale_marks_expire(self, tmp_path, monkeypatch):
+        import tools.skill_manager_tool as smt
+
+        smt._reset_background_review_read_marks()
+        p = tmp_path / "x" / "SKILL.md"
+        smt.mark_background_review_skill_read(p)
+        assert smt._background_review_has_read(p) is True
+        with smt._read_marks_lock:
+            for k in smt._read_marks:
+                smt._read_marks[k] -= smt._READ_MARK_TTL_S + 1
+        assert smt._background_review_has_read(p) is False
+        smt._reset_background_review_read_marks()
