@@ -1510,6 +1510,33 @@ def _maybe_debounced_sync_push(skill_name: str) -> None:
         _sync_push_timer.start()
 
 
+def _auto_commit_skills_repo(action: str, name: str) -> None:
+    """Commit the working tree of the skills repo after a successful write.
+
+    No-op when the skills dir is not a git repo or nothing changed. Uses
+    ``git add -A`` so supporting files created outside this tool's direct
+    target (references/, scripts/) are captured with the write that made them.
+    """
+    import subprocess
+
+    root = _skills_dir()
+    if not (root / ".git").is_dir():
+        return
+    subprocess.run(
+        ["git", "add", "-A"], cwd=root, capture_output=True, timeout=30, check=True,
+    )
+    staged = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"], cwd=root, capture_output=True, timeout=30,
+    )
+    if staged.returncode == 0:  # nothing staged
+        return
+    subprocess.run(
+        ["git", "commit", "-m", f"skill-manager: {action} {name}"],
+        cwd=root, capture_output=True, timeout=30, check=True,
+    )
+    logger.info("skill_manage: committed %s %s to skills repo", action, name)
+
+
 def skill_manage(
     action: str,
     name: str,
@@ -1607,6 +1634,15 @@ def skill_manage(
                     forget(name)
         except Exception:
             pass
+
+        # Version every skill write. The skills dir is a git repo (Dave's owned
+        # alie-skills); a month of curator writes once sat uncommitted with no
+        # audit trail, so an unversioned write is treated as a bug. Best-effort:
+        # a commit failure must never break the tool, but it is logged loudly.
+        try:
+            _auto_commit_skills_repo(action, name)
+        except Exception:
+            logger.exception("skill_manage: git auto-commit failed for %s/%s", action, name)
 
         # Sync push hook (debounced, best-effort). Fires only AFTER the
         # write gate passed (staged/unapproved writes never reach here -- the

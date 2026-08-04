@@ -874,3 +874,45 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+
+
+class TestGitAutoCommit:
+    """Every successful skill write must land as a git commit when the skills
+    dir is a repo (regression: a month of curator writes sat uncommitted)."""
+
+    @staticmethod
+    def _init_repo(path):
+        import subprocess
+        for cmd in (["git", "init", "-q"],
+                    ["git", "config", "user.email", "test@test"],
+                    ["git", "config", "user.name", "test"]):
+            subprocess.run(cmd, cwd=path, check=True, capture_output=True)
+
+    def test_create_commits(self, tmp_path):
+        import subprocess
+        self._init_repo(tmp_path)
+        with _skill_dir(tmp_path):
+            result = json.loads(skill_manage("create", "test-skill", content=VALID_SKILL_CONTENT))
+        assert result["success"]
+        log = subprocess.run(["git", "log", "--oneline"], cwd=tmp_path,
+                             capture_output=True, text=True).stdout
+        assert "skill-manager: create test-skill" in log
+
+    def test_edit_commits_on_top(self, tmp_path):
+        import subprocess
+        self._init_repo(tmp_path)
+        with _skill_dir(tmp_path):
+            skill_manage("create", "test-skill", content=VALID_SKILL_CONTENT)
+            result = json.loads(skill_manage("edit", "test-skill", content=VALID_SKILL_CONTENT_2))
+        assert result["success"]
+        log = subprocess.run(["git", "log", "--oneline"], cwd=tmp_path,
+                             capture_output=True, text=True).stdout
+        assert "skill-manager: edit test-skill" in log
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=tmp_path,
+                                capture_output=True, text=True).stdout
+        assert status.strip() == ""  # working tree clean after the write
+
+    def test_no_repo_is_noop(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = json.loads(skill_manage("create", "test-skill", content=VALID_SKILL_CONTENT))
+        assert result["success"]  # no .git — write succeeds, no commit attempted
