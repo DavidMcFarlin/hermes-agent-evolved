@@ -4102,10 +4102,24 @@ def _save_custom_provider(
                 entry["model"] = model
                 changed = True
             if model and context_length:
-                models_cfg = entry.get("models", {})
-                if not isinstance(models_cfg, dict):
-                    models_cfg = {}
-                models_cfg[model] = {"context_length": context_length}
+                models_cfg = entry.get("models")
+                if isinstance(models_cfg, dict):
+                    # Preserve existing per-model metadata — only add/update
+                    # the entry for THIS model, don't wipe the others.
+                    models_cfg[model] = {"context_length": context_length}
+                elif isinstance(models_cfg, list):
+                    # models is a list of IDs (e.g. from a live probe or
+                    # manual edit).  Convert to a metadata dict that
+                    # preserves every existing entry, adding context_length
+                    # only for the current model.
+                    models_cfg = {
+                        str(m): ({"context_length": context_length} if str(m) == model else {})
+                        for m in models_cfg
+                        if isinstance(m, str) and m.strip()
+                    }
+                    models_cfg[model] = {"context_length": context_length}
+                else:
+                    models_cfg = {model: {"context_length": context_length}}
                 entry["models"] = models_cfg
                 changed = True
             if api_mode:

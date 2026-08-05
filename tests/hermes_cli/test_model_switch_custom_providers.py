@@ -790,9 +790,17 @@ def test_discovered_models_auto_saved_to_cache(monkeypatch):
 
 
 def test_save_discovered_models_preserves_dict_form(monkeypatch):
-    """``_save_discovered_models_to_config`` must not replace a dict-form
-    ``models`` mapping (per-model metadata like ``context_length``) with
-    a flat list of strings (#67841)."""
+    """``_save_discovered_models_to_config`` must preserve per-model metadata
+    in a dict-form ``models`` mapping while merging in newly discovered models.
+
+    Originally (#67841) the dict was skipped entirely to protect curated
+    metadata.  But ``_save_custom_provider`` (main.py) writes a 1-entry dict
+    ``{model: {context_length}}`` during setup — the same shape.  Skipping it
+    meant a local Ollama with 15 models would show only 1 in every picker
+    that didn't live-probe (#73360).  The fix: merge the live model IDs into
+    the dict, adding empty metadata for models that don't have any yet, and
+    preserving existing per-model metadata for models that do.
+    """
     from hermes_cli.model_switch import _save_discovered_models_to_config
 
     save_calls = []
@@ -816,14 +824,26 @@ def test_save_discovered_models_preserves_dict_form(monkeypatch):
         },
     )
 
-    # Dict-form models must NOT be overwritten by discovered models
+    # Live probe discovers configured-model + a new model.
+    # The dict {configured-model} is a subset of the live list → merge.
     _save_discovered_models_to_config(
         "https://gateway.example.com/v1",
         ["configured-model", "discovered-model"],
     )
-    assert save_calls == [], (
-        "Dict-form models must not be replaced with a flat list"
+    assert len(save_calls) == 1, (
+        "Dict-form models that are a subset of the live list must be merged, "
+        "not skipped — otherwise new models never appear in the picker (#73360)"
     )
+    saved_models = save_calls[0]["custom_providers"][0]["models"]
+    assert isinstance(saved_models, dict), "Must stay dict-form"
+    assert "configured-model" in saved_models
+    assert saved_models["configured-model"] == {"context_length": 8192}, (
+        "Existing per-model metadata must be preserved"
+    )
+    assert "discovered-model" in saved_models, (
+        "Newly discovered models must be added to the dict"
+    )
+    assert saved_models["discovered-model"] == {}
 
 
 def test_shared_url_different_display_names_are_separate_rows(monkeypatch):
@@ -968,3 +988,65 @@ def test_custom_provider_dict_models_pin_requires_discover_false(monkeypatch):
     row = next(p for p in providers if p["name"] == "Local Ollama")
     assert calls == []
     assert row["models"] == ["llama3"]
+
+
+def test_save_custom_provider_preserves_list_when_adding_context_length(monkeypatch):
+    """``_save_custom_provider`` (main.py) must not wipe an existing list-form
+    ``models`` field when adding context_length for a model.
+
+    Regression test for #73360: when a user sets up an Ollama endpoint and
+    provides a context length, ``_save_custom_provider`` used to replace the
+    entire ``models`` field with ``{model: {context_length: N}}``, destroying
+    a previously-saved list of 15 model IDs.  The fix preserves the list
+    (converting to a metadata dict with all existing entries kept).
+    """
+    from hermes_cli.main import _save_custom_provider
+    from hermes_cli.config import load_config, save_config
+
+    # Set up a config with a list-form models field (from a live probe)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "custom_providers": [
+                {
+                    "name": "ollama",
+                    "base_url": "http://192.168.50.3:11434/v1",
+                    "model": "070freebird070/hermes-brain:v1",
+                    "models": [
+                        "ornith:35b",
+                        "070freebird070/hermes-brain:v1",
+                        "qwen3.6:35b",
+                    ],
+                }
+            ]
+        },
+    )
+
+    saved = {}
+    def fake_save(cfg):
+        saved.update(cfg)
+
+    monkeypatch.setattr("hermes_cli.config.save_config", fake_save)
+
+    # Simulate the user selecting a model with a context_length
+    _save_custom_provider(
+        "http://192.168.50.3:11434/v1",
+        api_key="",
+        model="qwen3.6:35b",
+        context_length=262144,
+        name="ollama",
+    )
+
+    assert saved, "save_config must have been called"
+    entry = saved["custom_providers"][0]
+    models = entry["models"]
+    assert isinstance(models, dict), "Must be converted to dict form"
+    # All three original models must be preserved as keys
+    assert "ornith:35b" in models
+    assert "070freebird070/hermes-brain:v1" in models
+    assert "qwen3.6:35b" in models
+    # Context length must only be set on the selected model
+    assert models["qwen3.6:35b"] == {"context_length": 262144}
+    # Other models must have empty metadata (preserved but no ctx)
+    assert models["ornith:35b"] == {}
+    assert models["070freebird070/hermes-brain:v1"] == {}

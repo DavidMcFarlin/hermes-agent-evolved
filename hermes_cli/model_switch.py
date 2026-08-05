@@ -161,8 +161,35 @@ def _save_discovered_models_to_config(
             # Preserve per-model metadata: when ``models`` is a mapping
             # (e.g. ``{"model-a": {"context_length": 8192}}``) or a list of
             # dicts (e.g. ``[{"id": "model-a", "context_length": 8192}]``),
-            # the user has curated metadata per model — do not replace it.
+            # the user has curated metadata per model.
+            #
+            # However, ``_save_custom_provider`` (main.py) writes a 1-entry
+            # dict ``{model: {"context_length": N}}`` during setup that only
+            # contains the selected model — not the full endpoint catalog.
+            # When the live probe discovers MORE models than the dict has
+            # keys, merge the new models into the dict (preserving existing
+            # per-model metadata) instead of skipping, so the picker shows
+            # every model the endpoint serves (#67841 + #73360).
             if isinstance(existing, dict):
+                existing_keys = {str(k) for k in existing}
+                live_set = set(model_ids)
+                # If the dict already covers every live model, it's a
+                # fully-curated metadata mapping — leave it alone.
+                if existing_keys and existing_keys == live_set:
+                    continue
+                # If the dict has keys NOT in the live list (user curated
+                # models the endpoint no longer serves), don't touch it —
+                # the user intentionally narrowed the catalog.
+                if existing_keys - live_set:
+                    continue
+                # The dict is a subset of the live list — merge the new
+                # models in, preserving existing per-model metadata.
+                merged = dict(existing)
+                for mid in model_ids:
+                    if mid not in merged:
+                        merged[mid] = {}
+                entry["models"] = merged
+                changed = True
                 continue
             if isinstance(existing, list) and any(
                 isinstance(m, dict) for m in existing
