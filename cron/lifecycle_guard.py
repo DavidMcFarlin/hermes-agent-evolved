@@ -259,13 +259,11 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     try:
         descriptor = os.open(path, flags)
     except (OSError, ValueError):
-        # ValueError: os.open() rejects a path containing an embedded NUL —
-        # which is exactly what tokenizing a BINARY's decoded contents
-        # produces (the caller's resolve() already tolerates this, but the
-        # open did not). Uncaught, it escaped the guard and failed the whole
-        # terminal command: live 2026-08-04, `./bedrock_server` in a Minecraft
-        # server update died with "Failed to execute command: embedded null
-        # byte" (#76762 follow-up).
+        # OSError: unreadable / missing / over-long paths. ValueError: an
+        # embedded NUL byte in *path* itself — a binary's decoded bytes
+        # tokenized into a bogus script path by the recursion (#77703). A
+        # guarded read must never crash the guard, so treat either as
+        # "nothing to scan" (mirrors the resolve() ValueError guard below).
         return None, False
     try:
         metadata = os.fstat(descriptor)
