@@ -2860,3 +2860,49 @@ class TestCreateAgentModelRecovery:
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
 
+
+
+class TestRunsConversationHistory:
+    """/v1/runs must continue a session, not restart it.
+
+    Regression for the 2026-08-05 context-loss bug: _handle_runs built
+    conversation_history only from an explicit `conversation_history` field, a
+    `previous_response_id`, or a multi-message `input` array. A client passing
+    `session_id` plus a single message — which is what Eleutheria's chat does
+    on every turn — got an empty history, so the agent saw only the new message
+    and had no idea what had just been said. In the wild it repeated the same
+    failed command on four consecutive turns and lost track of who the user was.
+    """
+
+    @pytest.mark.asyncio
+    async def test_session_id_alone_loads_that_sessions_history(self, adapter):
+        stored = [{"role": "user", "content": "earlier"},
+                  {"role": "assistant", "content": "noted"}]
+        with patch.object(adapter, "_conversation_history_for_session",
+                          new=AsyncMock(return_value=stored)) as fetch:
+            history = await adapter._run_history([], "s-1")
+        fetch.assert_awaited_once_with("s-1")
+        assert history == stored
+
+    @pytest.mark.asyncio
+    async def test_explicit_history_still_wins(self, adapter):
+        explicit = [{"role": "user", "content": "mine"}]
+        with patch.object(adapter, "_conversation_history_for_session",
+                          new=AsyncMock(return_value=[{"role": "user", "content": "stored"}])) as fetch:
+            history = await adapter._run_history(explicit, "s-1")
+        fetch.assert_not_awaited()
+        assert history == explicit
+
+    @pytest.mark.asyncio
+    async def test_no_session_id_loads_nothing(self, adapter):
+        with patch.object(adapter, "_conversation_history_for_session",
+                          new=AsyncMock(return_value=[{"role": "user", "content": "stored"}])) as fetch:
+            history = await adapter._run_history([], None)
+        fetch.assert_not_awaited()
+        assert history == []
+
+    @pytest.mark.asyncio
+    async def test_a_store_failure_degrades_to_empty_not_an_exception(self, adapter):
+        with patch.object(adapter, "_conversation_history_for_session",
+                          new=AsyncMock(return_value=[])):
+            assert await adapter._run_history([], "s-missing") == []

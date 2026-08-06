@@ -3246,6 +3246,23 @@ class APIServerAdapter(BasePlatformAdapter):
             return None, web.json_response(_openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404)
         return session, None
 
+    async def _run_history(self, explicit: List[Dict[str, Any]],
+                           session_id: Optional[str]) -> List[Dict[str, Any]]:
+        """History for a /v1/runs turn.
+
+        A caller that gives a session_id but no explicit history means
+        "continue that conversation" — load it from the session store, the same
+        way /api/sessions/{id}/chat does. Without this EVERY /v1/runs turn
+        starts blank: the agent sees only the new message and cannot know what
+        was just said, so a multi-turn client re-derives everything each turn
+        and contradicts itself. Explicit conversation_history (and the history
+        recovered from previous_response_id) still wins, so callers that manage
+        their own history are unaffected.
+        """
+        if explicit or not session_id:
+            return explicit
+        return await self._conversation_history_for_session(session_id)
+
     async def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
         db = await self._ensure_session_db_async()
         if db is None:
@@ -6370,6 +6387,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         session_id = body.get("session_id") or stored_session_id
+        conversation_history = await self._run_history(conversation_history, session_id)
+
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
         selection_error = self._request_route_conflict_error(
